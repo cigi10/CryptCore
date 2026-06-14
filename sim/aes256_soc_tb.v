@@ -1,18 +1,4 @@
 `timescale 1ns / 1ps
-// ============================================================================
-// aes256_soc_tb.v  -  AES-256 AXI4-Lite Wrapper Testbench
-//
-// Root cause of SoC timeout:
-//   The AES-256 key schedule takes 52 clock cycles to complete after
-//   key_valid is pulsed.  The original TB called encrypt_axi() immediately
-//   after load_key_axi(), but the pipeline gates valid_in with key_ready,
-//   so the block was silently dropped → valid_out never came → timeout.
-//
-// Fix:
-//   STATUS register bit 1 now reflects key_ready (added to wrapper).
-//   load_key_axi() polls STATUS[1] until key_ready before returning.
-//   encrypt_axi() therefore never fires until the key schedule is done.
-// ============================================================================
 
 module aes256_soc_tb;
 
@@ -142,26 +128,6 @@ module aes256_soc_tb;
         end
     endtask
 
-    // -------------------------------------------------------------------------
-    // Task: poll STATUS[1] (key_ready) until set
-    // Key schedule takes 52 cycles; each AXI read ~4 cycles → 20 polls enough,
-    // but we use 100 for margin.
-    // -------------------------------------------------------------------------
-    task wait_key_ready;
-        begin
-            timeout = 0;
-            begin : poll_key
-                reg [31:0] status;
-                status = 32'h0;
-                while (status[1] !== 1'b1 && timeout < 100) begin
-                    axi_read(8'h04, status);
-                    timeout = timeout + 1;
-                end
-                if (timeout >= 100)
-                    $display("WARNING: timed out waiting for STATUS[1]=key_ready");
-            end
-        end
-    endtask
 
     // -------------------------------------------------------------------------
     // Task: full reset
@@ -180,26 +146,32 @@ module aes256_soc_tb;
         end
     endtask
 
-    // -------------------------------------------------------------------------
-    // Task: write key registers + pulse CTRL bit1, then WAIT for key_ready
-    // This is the critical fix: we block here until the key schedule finishes.
-    // -------------------------------------------------------------------------
-    task load_key_axi;
-        input [255:0] k;
-        begin
-            axi_write(8'h08, k[255:224]);
-            axi_write(8'h0C, k[223:192]);
-            axi_write(8'h10, k[191:160]);
-            axi_write(8'h14, k[159:128]);
-            axi_write(8'h18, k[127:96]);
-            axi_write(8'h1C, k[95:64]);
-            axi_write(8'h20, k[63:32]);
-            axi_write(8'h24, k[31:0]);
-            axi_write(8'h00, 32'h00000002);  // bit1 = load_key
-            // Block until key schedule is done before returning
-            wait_key_ready;
-        end
-    endtask
+// -------------------------------------------------------------------------
+// Task: write key registers + pulse CTRL bit1
+//
+// NOTE:
+// Wrapper only exposes STATUS[0] = done.
+// key_ready is internal to the AES core and not visible via AXI.
+// We therefore wait a fixed number of cycles after asserting key_valid.
+// -------------------------------------------------------------------------
+task load_key_axi;
+    input [255:0] k;
+    begin
+        axi_write(8'h08, k[255:224]);
+        axi_write(8'h0C, k[223:192]);
+        axi_write(8'h10, k[191:160]);
+        axi_write(8'h14, k[159:128]);
+        axi_write(8'h18, k[127:96]);
+        axi_write(8'h1C, k[95:64]);
+        axi_write(8'h20, k[63:32]);
+        axi_write(8'h24, k[31:0]);
+
+        axi_write(8'h00, 32'h00000002); // bit1 = load_key
+
+        // Allow key schedule to complete
+        repeat (60) @(posedge aclk);
+    end
+endtask
 
     // -------------------------------------------------------------------------
     // Task: write plaintext, start, poll done, read ciphertext
@@ -333,8 +305,8 @@ module aes256_soc_tb;
             encrypt_axi(128'h00000000000000000000000000000000, result);
 
             axi_read(8'h04, status);
-            $display("Status after 1st encrypt   : done=%0b key_ready=%0b (expect 1 1)",
-                      status[0], status[1]);
+            $display("Status after 1st encrypt   : done=%0b (expect 1)",
+                 status[0]);
 
             axi_write(8'h28, 32'hdeadbeef);
             axi_write(8'h2C, 32'hcafebabe);
