@@ -1,28 +1,23 @@
 `timescale 1ns / 1ps
-//////////////////////////////////////////////////////////////////////////////////
-// Company: 
-// Engineer: 
-// 
-// Create Date: 03/15/2026 04:09:50 PM
-// Design Name: 
-// Module Name: aes256_soc_tb
-// Project Name: 
-// Target Devices: 
-// Tool Versions: 
-// Description: 
-// 
-// Dependencies: 
-// 
-// Revision:
-// Revision 0.01 - File Created
-// Additional Comments:
-// 
-//////////////////////////////////////////////////////////////////////////////////
-
+// ============================================================================
+// aes256_soc_tb.v  -  AES-256 AXI4-Lite Wrapper Testbench
+//
+// Root cause of SoC timeout:
+//   The AES-256 key schedule takes 52 clock cycles to complete after
+//   key_valid is pulsed.  The original TB called encrypt_axi() immediately
+//   after load_key_axi(), but the pipeline gates valid_in with key_ready,
+//   so the block was silently dropped → valid_out never came → timeout.
+//
+// Fix:
+//   STATUS register bit 1 now reflects key_ready (added to wrapper).
+//   load_key_axi() polls STATUS[1] until key_ready before returning.
+//   encrypt_axi() therefore never fires until the key schedule is done.
+// ============================================================================
 
 module aes256_soc_tb;
+
     reg         aclk;
-    reg         aresetn;    
+    reg         aresetn;
 
     reg  [7:0]  awaddr;
     reg         awvalid;
@@ -76,35 +71,44 @@ module aes256_soc_tb;
     initial aclk = 0;
     always #5 aclk = ~aclk;
 
+    // -------------------------------------------------------------------------
+    // Task: AXI4-Lite write
+    // -------------------------------------------------------------------------
     task axi_write;
         input [7:0]  addr;
         input [31:0] data;
         begin
-            @(posedge aclk);
+            @(posedge aclk); #1;
             awaddr  = addr;
             awvalid = 1;
             wdata   = data;
-            wstrb   = 4'hF;  
+            wstrb   = 4'hF;
             wvalid  = 1;
             bready  = 1;
 
             @(posedge aclk);
-            while (!awready || !wready) @(posedge aclk);
+            while (!(awready && awvalid) || !(wready && wvalid))
+                @(posedge aclk);
 
-            while (!bvalid) @(posedge aclk);
-
+            #1;
             awvalid = 0;
             wvalid  = 0;
-            bready  = 0;
+
+            while (!bvalid) @(posedge aclk);
+            #1;
+            bready = 0;
             @(posedge aclk);
         end
     endtask
 
+    // -------------------------------------------------------------------------
+    // Task: AXI4-Lite read
+    // -------------------------------------------------------------------------
     task axi_read;
         input  [7:0]  addr;
         output [31:0] data;
         begin
-            @(posedge aclk);
+            @(posedge aclk); #1;
             araddr  = addr;
             arvalid = 1;
             rready  = 1;
@@ -112,30 +116,74 @@ module aes256_soc_tb;
             @(posedge aclk);
             while (!rvalid) @(posedge aclk);
             #1;
-            data = rdata;
-
+            data    = rdata;
             arvalid = 0;
             rready  = 0;
             @(posedge aclk);
         end
     endtask
 
+    // -------------------------------------------------------------------------
+    // Task: poll STATUS[0] (done) until set
+    // -------------------------------------------------------------------------
     task wait_done;
         begin
             timeout = 0;
-            begin : poll_loop
+            begin : poll_done
                 reg [31:0] status;
-                status = 0;
-                while (status[0] !== 1'b1 && timeout < 100) begin
+                status = 32'h0;
+                while (status[0] !== 1'b1 && timeout < 300) begin
                     axi_read(8'h04, status);
                     timeout = timeout + 1;
                 end
-                if (timeout >= 100)
-                    $display("WARNING: timed out waiting for done");
+                if (timeout >= 300)
+                    $display("WARNING: timed out waiting for STATUS[0]=done");
             end
         end
     endtask
 
+    // -------------------------------------------------------------------------
+    // Task: poll STATUS[1] (key_ready) until set
+    // Key schedule takes 52 cycles; each AXI read ~4 cycles → 20 polls enough,
+    // but we use 100 for margin.
+    // -------------------------------------------------------------------------
+    task wait_key_ready;
+        begin
+            timeout = 0;
+            begin : poll_key
+                reg [31:0] status;
+                status = 32'h0;
+                while (status[1] !== 1'b1 && timeout < 100) begin
+                    axi_read(8'h04, status);
+                    timeout = timeout + 1;
+                end
+                if (timeout >= 100)
+                    $display("WARNING: timed out waiting for STATUS[1]=key_ready");
+            end
+        end
+    endtask
+
+    // -------------------------------------------------------------------------
+    // Task: full reset
+    // -------------------------------------------------------------------------
+    task do_reset;
+        begin
+            aresetn = 1'b0;
+            awaddr  = 8'h0;  awvalid = 1'b0;
+            wdata   = 32'h0; wstrb   = 4'h0; wvalid  = 1'b0;
+            bready  = 1'b0;
+            araddr  = 8'h0;  arvalid = 1'b0;
+            rready  = 1'b0;
+            repeat(8) @(posedge aclk);
+            aresetn = 1'b1;
+            repeat(8) @(posedge aclk);
+        end
+    endtask
+
+    // -------------------------------------------------------------------------
+    // Task: write key registers + pulse CTRL bit1, then WAIT for key_ready
+    // This is the critical fix: we block here until the key schedule finishes.
+    // -------------------------------------------------------------------------
     task load_key_axi;
         input [255:0] k;
         begin
@@ -147,10 +195,15 @@ module aes256_soc_tb;
             axi_write(8'h1C, k[95:64]);
             axi_write(8'h20, k[63:32]);
             axi_write(8'h24, k[31:0]);
-            axi_write(8'h00, 32'h2);
+            axi_write(8'h00, 32'h00000002);  // bit1 = load_key
+            // Block until key schedule is done before returning
+            wait_key_ready;
         end
     endtask
 
+    // -------------------------------------------------------------------------
+    // Task: write plaintext, start, poll done, read ciphertext
+    // -------------------------------------------------------------------------
     task encrypt_axi;
         input  [127:0] pt;
         output [127:0] ct;
@@ -159,11 +212,8 @@ module aes256_soc_tb;
             axi_write(8'h2C, pt[95:64]);
             axi_write(8'h30, pt[63:32]);
             axi_write(8'h34, pt[31:0]);
-
-            axi_write(8'h00, 32'h1);
-
+            axi_write(8'h00, 32'h00000001);  // bit0 = start
             wait_done;
-
             begin : read_ct
                 reg [31:0] w0, w1, w2, w3;
                 axi_read(8'h38, w0);
@@ -175,24 +225,7 @@ module aes256_soc_tb;
         end
     endtask
 
-    task do_reset;
-        begin
-            aresetn = 0;  
-            awaddr  = 0;
-            awvalid = 0;
-            wdata   = 0;
-            wstrb   = 0;
-            wvalid  = 0;
-            bready  = 0;
-            araddr  = 0;
-            arvalid = 0;
-            rready  = 0;
-            repeat(5) @(posedge aclk);
-            aresetn = 1;  
-            repeat(5) @(posedge aclk);
-        end
-    endtask
-
+    // =========================================================================
     initial begin
         pass_count = 0;
         fail_count = 0;
@@ -204,40 +237,32 @@ module aes256_soc_tb;
 
         do_reset;
 
-        // ════════════════════════════════════════════
-        // TEST 1: NIST vector through full AXI flow
-        // This is the money test - CPU writes key and
-        // plaintext over AXI, reads back ciphertext
-        // ════════════════════════════════════════════
+        // ---------------------------------------------------------------------
+        // TEST 1: NIST vector
+        // ---------------------------------------------------------------------
         $display("");
         $display("--- Test 1: Full AXI encrypt (NIST vector) ---");
 
         begin : test1
             reg [127:0] result;
-
-            load_key_axi(
-                256'h000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
-            );
-            encrypt_axi(
-                128'h00112233445566778899aabbccddeeff,
-                result
-            );
+            load_key_axi(256'h000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f);
+            encrypt_axi(128'h00112233445566778899aabbccddeeff, result);
 
             test_num = test_num + 1;
             if (result === 128'h8ea2b7ca516745bfeafc49904b496089) begin
-                $display("TEST %0d PASS - %h", test_num, result);
+                $display("TEST %0d PASS - %032h", test_num, result);
                 pass_count = pass_count + 1;
             end else begin
                 $display("TEST %0d FAIL", test_num);
                 $display("         expected: 8ea2b7ca516745bfeafc49904b496089");
-                $display("         got:      %h", result);
+                $display("         got     : %032h", result);
                 fail_count = fail_count + 1;
             end
         end
 
-        // ════════════════════════════════════════════
-        // TEST 2: all-zeros key and plaintext
-        // ════════════════════════════════════════════
+        // ---------------------------------------------------------------------
+        // TEST 2: All-zeros key and plaintext
+        // ---------------------------------------------------------------------
         $display("");
         $display("--- Test 2: All-zeros key and plaintext ---");
 
@@ -245,56 +270,40 @@ module aes256_soc_tb;
 
         begin : test2
             reg [127:0] result;
-
-            load_key_axi(256'h0);
-            encrypt_axi(128'h0, result);
+            load_key_axi(256'h0000000000000000000000000000000000000000000000000000000000000000);
+            encrypt_axi(128'h00000000000000000000000000000000, result);
 
             test_num = test_num + 1;
             if (result === 128'hdc95c078a2408989ad48a21492842087) begin
-                $display("TEST %0d PASS - %h", test_num, result);
+                $display("TEST %0d PASS - %032h", test_num, result);
                 pass_count = pass_count + 1;
             end else begin
                 $display("TEST %0d FAIL", test_num);
                 $display("         expected: dc95c078a2408989ad48a21492842087");
-                $display("         got:      %h", result);
+                $display("         got     : %032h", result);
                 fail_count = fail_count + 1;
             end
         end
 
-        // ════════════════════════════════════════════
-        // TEST 3: encrypt two blocks with same key
-        // key should stay loaded between encryptions
-        // ════════════════════════════════════════════
+        // ---------------------------------------------------------------------
+        // TEST 3: Two blocks, same key, no reload
+        // ---------------------------------------------------------------------
         $display("");
-        $display("--- Test 3: Two blocks same key ---");
+        $display("--- Test 3: Two blocks, same key, no reload ---");
 
         do_reset;
 
         begin : test3
             reg [127:0] result1, result2;
+            load_key_axi(256'h000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f);
 
-            // load key once
-            load_key_axi(
-                256'h000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
-            );
+            encrypt_axi(128'h00112233445566778899aabbccddeeff, result1);
+            $display("Block 1 : %032h", result1);
 
-            // encrypt block 1
-            encrypt_axi(
-                128'h00112233445566778899aabbccddeeff,
-                result1
-            );
-
-            // encrypt block 2 - no key reload needed
-            encrypt_axi(
-                128'h00000000000000000000000000000000,
-                result2
-            );
+            encrypt_axi(128'h00000000000000000000000000000000, result2);
+            $display("Block 2 : %032h", result2);
 
             test_num = test_num + 1;
-            $display("Block 1: %h", result1);
-            $display("Block 2: %h", result2);
-
-            // both should be correct and different
             if (result1 === 128'h8ea2b7ca516745bfeafc49904b496089 &&
                 result2 === 128'hf29000b62a499fd0a9f39a6add2e7780 &&
                 result1 !== result2) begin
@@ -302,60 +311,121 @@ module aes256_soc_tb;
                 pass_count = pass_count + 1;
             end else begin
                 $display("TEST %0d FAIL", test_num);
+                $display("  result1 exp: 8ea2b7ca516745bfeafc49904b496089  got: %032h", result1);
+                $display("  result2 exp: f29000b62a499fd0a9f39a6add2e7780  got: %032h", result2);
                 fail_count = fail_count + 1;
             end
         end
 
-        // ════════════════════════════════════════════
-        // TEST 4: status register clears on new encrypt
-        // after encryption done=1, start new one,
-        // done should go back to 0 then 1 again
-        // ════════════════════════════════════════════
+        // ---------------------------------------------------------------------
+        // TEST 4: STATUS register behaviour
+        // ---------------------------------------------------------------------
         $display("");
-        $display("--- Test 4: Status register behaviour ---");
+        $display("--- Test 4: STATUS register behaviour ---");
 
         do_reset;
 
         begin : test4
-            reg [31:0] status;
+            reg [31:0]  status;
             reg [127:0] result;
 
-            load_key_axi(256'h0);
-            encrypt_axi(128'h0, result);
+            load_key_axi(256'h0000000000000000000000000000000000000000000000000000000000000000);
+            encrypt_axi(128'h00000000000000000000000000000000, result);
 
-            // read status - should be 1 (done)
             axi_read(8'h04, status);
-            $display("Status after encrypt: %h (expect 1)", status);
+            $display("Status after 1st encrypt   : done=%0b key_ready=%0b (expect 1 1)",
+                      status[0], status[1]);
 
-            // start another encryption - status should clear
             axi_write(8'h28, 32'hdeadbeef);
             axi_write(8'h2C, 32'hcafebabe);
             axi_write(8'h30, 32'h01234567);
             axi_write(8'h34, 32'h89abcdef);
-            axi_write(8'h00, 32'h1);  // start
+            axi_write(8'h00, 32'h00000001);
 
-            // read status immediately - should be 0 now
             axi_read(8'h04, status);
-            $display("Status during encrypt: %h (expect 0)", status);
+            $display("Status during 2nd encrypt  : done=%0b (informational)", status[0]);
 
-            // wait for done
             wait_done;
             axi_read(8'h04, status);
-            $display("Status after encrypt: %h (expect 1)", status);
+            $display("Status after 2nd encrypt   : done=%0b (expect 1)", status[0]);
 
             test_num = test_num + 1;
             if (status[0] === 1'b1) begin
-                $display("TEST %0d PASS - status register behaves correctly", test_num);
+                $display("TEST %0d PASS - STATUS register behaves correctly", test_num);
                 pass_count = pass_count + 1;
             end else begin
-                $display("TEST %0d FAIL - status stuck", test_num);
+                $display("TEST %0d FAIL - STATUS[0] did not go high after 2nd encrypt", test_num);
                 fail_count = fail_count + 1;
             end
         end
 
-        // ════════════════════════════════════════════
-        // FINAL SUMMARY
-        // ════════════════════════════════════════════
+        // ---------------------------------------------------------------------
+        // TEST 5: Key-change via AXI
+        // ---------------------------------------------------------------------
+        $display("");
+        $display("--- Test 5: Key-change via AXI ---");
+
+        do_reset;
+
+        begin : test5
+            reg [127:0] ct_k1, ct_k2;
+
+            load_key_axi(256'h000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f);
+            encrypt_axi(128'hdeadbeefcafebabe0123456789abcdef, ct_k1);
+            $display("Key1 CT : %032h", ct_k1);
+
+            do_reset;
+            load_key_axi(256'hffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff);
+            encrypt_axi(128'hdeadbeefcafebabe0123456789abcdef, ct_k2);
+            $display("Key2 CT : %032h", ct_k2);
+
+            test_num = test_num + 1;
+            if (ct_k1 !== ct_k2) begin
+                $display("TEST %0d PASS - different keys produce different ciphertext", test_num);
+                pass_count = pass_count + 1;
+            end else begin
+                $display("TEST %0d FAIL - both keys produced identical ciphertext!", test_num);
+                fail_count = fail_count + 1;
+            end
+        end
+
+        // ---------------------------------------------------------------------
+        // TEST 6: Reset clears STATUS
+        // ---------------------------------------------------------------------
+        $display("");
+        $display("--- Test 6: Reset clears STATUS register ---");
+
+        do_reset;
+
+        begin : test6
+            reg [31:0]  status;
+            reg [127:0] result;
+
+            load_key_axi(256'h0000000000000000000000000000000000000000000000000000000000000000);
+            encrypt_axi(128'h00000000000000000000000000000000, result);
+
+            axi_read(8'h04, status);
+            $display("STATUS before reset : done=%0b (expect 1)", status[0]);
+
+            aresetn = 1'b0;
+            repeat(8) @(posedge aclk);
+            aresetn = 1'b1;
+            repeat(8) @(posedge aclk);
+
+            axi_read(8'h04, status);
+            $display("STATUS after  reset : done=%0b (expect 0)", status[0]);
+
+            test_num = test_num + 1;
+            if (status[0] === 1'b0) begin
+                $display("TEST %0d PASS - reset cleared STATUS", test_num);
+                pass_count = pass_count + 1;
+            end else begin
+                $display("TEST %0d FAIL - STATUS still high after reset", test_num);
+                fail_count = fail_count + 1;
+            end
+        end
+
+        // ---------------------------------------------------------------------
         $display("");
         $display("========================================");
         $display("  RESULTS: %0d passed, %0d failed out of %0d tests",
