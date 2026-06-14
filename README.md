@@ -114,6 +114,12 @@ cryptcore/
 │   ├── aes256_pipelined.v        # 29-stage AES-256 pipeline core
 │   ├── aes256_axi_wrapper.v      # AXI4-Lite slave wrapper + register file
 │   └── sbox.v                    # AES S-box (256-entry LUT)
+│   └── addRoundKey.v
+│   └── encryptRound.v
+│   └── keyExpansion.v
+│   └── mixColumns.v
+│   └── shiftRows.v
+│   └── subBytes.v
 ├── bd/
 │   └── cryptcore.bd             # Vivado block design (MicroBlaze SoC)
 ├── constraints/
