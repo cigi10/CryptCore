@@ -121,7 +121,7 @@ cryptcore/
 │   └── shiftRows.v
 │   └── subBytes.v
 ├── bd/
-│   └── cryptcore.bd             # Vivado block design (MicroBlaze SoC)
+│   └── crypto_soc.bd             # Vivado block design (MicroBlaze SoC)
 ├── constraints/
 │   └── cryptcore_wrapper.xdc    # Pin assignments + timing constraints
 ├── sim/
