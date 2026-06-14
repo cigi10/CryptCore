@@ -1,4 +1,7 @@
 `timescale 1ns / 1ps
+// ============================================================================
+// aes256_core_tb.v  -  AES-256 Pipelined Core Testbench
+// ============================================================================
 
 module aes256_core_tb;
 
@@ -30,7 +33,9 @@ module aes256_core_tb;
     initial clk = 0;
     always #5 clk = ~clk;
 
-    // ─── Task: reset + full pipeline flush ───────────
+    // -------------------------------------------------------------------------
+    // Task: reset + full pipeline flush
+    // -------------------------------------------------------------------------
     task do_reset;
         begin
             rst       = 1;
@@ -38,13 +43,17 @@ module aes256_core_tb;
             valid_in  = 0;
             key       = 256'h0;
             plaintext = 128'h0;
-            repeat(3) @(posedge clk);
+            repeat(5) @(posedge clk);
             rst = 0;
-            repeat(20) @(posedge clk); // flush all 15 stages
+            repeat(35) @(posedge clk); // flush 29-stage pipeline + margin
         end
     endtask
 
-    // ─── Task: load key ──────────────────────────────
+    // -------------------------------------------------------------------------
+    // Task: load key and wait for key schedule to finish
+    // AES-256 key expansion: words 0-7 loaded on key_valid, words 8-59
+    // computed one per cycle (52 cycles). Wait 60 cycles for ready.
+    // -------------------------------------------------------------------------
     task load_key;
         input [255:0] k;
         begin
@@ -53,23 +62,25 @@ module aes256_core_tb;
             key_valid = 1;
             @(posedge clk);
             key_valid = 0;
-            @(posedge clk);
+            repeat(60) @(posedge clk);
         end
     endtask
 
-    // ─── Task: wait for valid_out ────────────────────
+    // -------------------------------------------------------------------------
+    // Task: wait for valid_out (timeout 150 cycles)
+    // -------------------------------------------------------------------------
     task wait_for_output;
         output [127:0] captured_ct;
         output         timed_out;
         begin
             timeout   = 0;
             timed_out = 0;
-            while (valid_out !== 1'b1 && timeout < 60) begin
+            while (valid_out !== 1'b1 && timeout < 150) begin
                 @(posedge clk);
                 timeout = timeout + 1;
             end
             #1;
-            if (timeout >= 60) begin
+            if (timeout >= 150) begin
                 timed_out   = 1;
                 captured_ct = 128'hx;
             end else begin
@@ -79,7 +90,9 @@ module aes256_core_tb;
         end
     endtask
 
-    // ─── Task: encrypt and check ─────────────────────
+    // -------------------------------------------------------------------------
+    // Task: encrypt one block and compare against expected ciphertext
+    // -------------------------------------------------------------------------
     task encrypt_and_check;
         input [127:0] pt;
         input [127:0] expected_ct;
@@ -94,25 +107,26 @@ module aes256_core_tb;
                 wait_for_output(captured, timed_out);
                 test_num = test_num + 1;
                 if (timed_out) begin
-                    $display("TEST %0d FAIL - timed out", test_num);
-                    $display("         plaintext : %h", pt);
-                    $display("         expected  : %h", expected_ct);
+                    $display("TEST %0d FAIL - timed out waiting for valid_out", test_num);
+                    $display("         plaintext : %032h", pt);
+                    $display("         expected  : %032h", expected_ct);
                     fail_count = fail_count + 1;
                 end else if (captured === expected_ct) begin
-                    $display("TEST %0d PASS - %h", test_num, captured);
+                    $display("TEST %0d PASS - ciphertext = %032h", test_num, captured);
                     pass_count = pass_count + 1;
                 end else begin
                     $display("TEST %0d FAIL - wrong ciphertext", test_num);
-                    $display("         plaintext : %h", pt);
-                    $display("         expected  : %h", expected_ct);
-                    $display("         got       : %h", captured);
+                    $display("         plaintext : %032h", pt);
+                    $display("         expected  : %032h", expected_ct);
+                    $display("         got       : %032h", captured);
                     fail_count = fail_count + 1;
                 end
             end
-            repeat(20) @(posedge clk); // flush before next test
+            repeat(35) @(posedge clk); // flush before next test
         end
     endtask
 
+    // =========================================================================
     initial begin
         pass_count = 0;
         fail_count = 0;
@@ -120,22 +134,26 @@ module aes256_core_tb;
 
         $display("========================================");
         $display("  AES-256 Pipelined Core Verification  ");
+        $display("  Pipeline depth : 29 stages           ");
+        $display("  Key sched lag  : ~52 cycles          ");
         $display("========================================");
 
         do_reset;
 
-        // ════════════════════════════════════════════
+        // ---------------------------------------------------------------------
         // GROUP 1: NIST FIPS-197 Official Test Vectors
-        // ════════════════════════════════════════════
+        // ---------------------------------------------------------------------
         $display("");
         $display("--- Group 1: NIST FIPS-197 Vectors ---");
 
+        // Vector 1
         load_key(256'h000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f);
         encrypt_and_check(
             128'h00112233445566778899aabbccddeeff,
             128'h8ea2b7ca516745bfeafc49904b496089
         );
 
+        // Vector 2: all-zero key, all-zero plaintext
         do_reset;
         load_key(256'h0000000000000000000000000000000000000000000000000000000000000000);
         encrypt_and_check(
@@ -143,6 +161,7 @@ module aes256_core_tb;
             128'hdc95c078a2408989ad48a21492842087
         );
 
+        // Vector 3: all-zero key, all-ones plaintext
         do_reset;
         load_key(256'h0000000000000000000000000000000000000000000000000000000000000000);
         encrypt_and_check(
@@ -150,6 +169,7 @@ module aes256_core_tb;
             128'hacdace8078a32b1a182bfa4987ca1347
         );
 
+        // Vector 4: all-ones key, all-zero plaintext
         do_reset;
         load_key(256'hffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff);
         encrypt_and_check(
@@ -157,9 +177,9 @@ module aes256_core_tb;
             128'h4bf85f1b5d54adbc307b0a048389adcb
         );
 
-        // ════════════════════════════════════════════
-        // GROUP 2: Key change test
-        // ════════════════════════════════════════════
+        // ---------------------------------------------------------------------
+        // GROUP 2: Key-change test
+        // ---------------------------------------------------------------------
         $display("");
         $display("--- Group 2: Key Change Test ---");
 
@@ -176,7 +196,7 @@ module aes256_core_tb;
             reg         to1, to2;
 
             wait_for_output(ct_key1, to1);
-            $display("Key1 ciphertext: %h", ct_key1);
+            $display("Key1 ciphertext : %032h", ct_key1);
 
             do_reset;
             load_key(256'hffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff);
@@ -186,21 +206,22 @@ module aes256_core_tb;
             valid_in  = 0;
 
             wait_for_output(ct_key2, to2);
-            $display("Key2 ciphertext: %h", ct_key2);
+            $display("Key2 ciphertext : %032h", ct_key2);
 
             test_num = test_num + 1;
             if (!to1 && !to2 && ct_key1 !== ct_key2) begin
                 $display("TEST %0d PASS - different keys produce different output", test_num);
                 pass_count = pass_count + 1;
             end else begin
-                $display("TEST %0d FAIL - key change test failed", test_num);
+                $display("TEST %0d FAIL - key change test failed (to1=%0b to2=%0b same=%0b)",
+                          test_num, to1, to2, (ct_key1 === ct_key2));
                 fail_count = fail_count + 1;
             end
         end
 
-        // ════════════════════════════════════════════
+        // ---------------------------------------------------------------------
         // GROUP 3: Avalanche effect test
-        // ════════════════════════════════════════════
+        // ---------------------------------------------------------------------
         $display("");
         $display("--- Group 3: Avalanche Effect Test ---");
 
@@ -220,7 +241,7 @@ module aes256_core_tb;
             integer     j;
 
             wait_for_output(ct_orig, to1);
-            $display("Original  PT=0x00..00: %h", ct_orig);
+            $display("Original  PT=0x00..00 : %032h", ct_orig);
 
             do_reset;
             load_key(256'h000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f);
@@ -230,7 +251,7 @@ module aes256_core_tb;
             valid_in  = 0;
 
             wait_for_output(ct_flip, to2);
-            $display("1-bit flip PT=0x00..01: %h", ct_flip);
+            $display("1-bit flip PT=0x00..01: %032h", ct_flip);
 
             diff     = ct_orig ^ ct_flip;
             bit_diff = 0;
@@ -249,9 +270,9 @@ module aes256_core_tb;
             end
         end
 
-        // ════════════════════════════════════════════
-        // GROUP 4: Reset behaviour test
-        // ════════════════════════════════════════════
+        // ---------------------------------------------------------------------
+        // GROUP 4: Reset behaviour
+        // ---------------------------------------------------------------------
         $display("");
         $display("--- Group 4: Reset Behaviour Test ---");
 
@@ -261,12 +282,12 @@ module aes256_core_tb;
         valid_in  = 1;
         @(posedge clk);
         valid_in  = 0;
-        repeat(5) @(posedge clk);
+        repeat(8) @(posedge clk);
 
         rst = 1;
-        repeat(3) @(posedge clk);
+        repeat(5) @(posedge clk);
         rst = 0;
-        repeat(25) @(posedge clk);
+        repeat(40) @(posedge clk);
         #1;
 
         test_num = test_num + 1;
@@ -278,9 +299,9 @@ module aes256_core_tb;
             fail_count = fail_count + 1;
         end
 
-        // ════════════════════════════════════════════
-        // GROUP 5: Back-to-back throughput test
-        // ════════════════════════════════════════════
+        // ---------------------------------------------------------------------
+        // GROUP 5: Back-to-back throughput
+        // ---------------------------------------------------------------------
         $display("");
         $display("--- Group 5: Back-to-Back Throughput Test ---");
 
@@ -303,12 +324,12 @@ module aes256_core_tb;
             integer watch;
             out_count = 0;
 
-            for (watch = 0; watch < 40; watch = watch + 1) begin
+            for (watch = 0; watch < 60; watch = watch + 1) begin
                 @(posedge clk);
                 #1;
                 if (valid_out === 1'b1) begin
                     out_count = out_count + 1;
-                    $display("Block %0d out: %h", out_count, ciphertext);
+                    $display("Block %0d out: %032h", out_count, ciphertext);
                 end
             end
 
@@ -322,9 +343,29 @@ module aes256_core_tb;
             end
         end
 
-        // ════════════════════════════════════════════
+        // ---------------------------------------------------------------------
+        // GROUP 6: Re-key and verify correctness
+        // ---------------------------------------------------------------------
+        $display("");
+        $display("--- Group 6: Re-Key and Verify Correctness ---");
+
+        do_reset;
+        load_key(256'h000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f);
+        encrypt_and_check(
+            128'h00112233445566778899aabbccddeeff,
+            128'h8ea2b7ca516745bfeafc49904b496089
+        );
+
+        do_reset;
+        load_key(256'h0000000000000000000000000000000000000000000000000000000000000000);
+        encrypt_and_check(
+            128'h00000000000000000000000000000000,
+            128'hdc95c078a2408989ad48a21492842087
+        );
+
+        // ---------------------------------------------------------------------
         // FINAL SUMMARY
-        // ════════════════════════════════════════════
+        // ---------------------------------------------------------------------
         $display("");
         $display("========================================");
         $display("  RESULTS: %0d passed, %0d failed out of %0d tests",
