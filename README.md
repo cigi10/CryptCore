@@ -162,7 +162,7 @@ set_clock_groups -physically_exclusive \
 |----------|------|-----------|-------------|
 | Slice LUTs | 15,616 | 63,400 | 24.6% |
 | Slice Registers | 11,461 | 126,800 | 9.0% |
-| F7/F8 Muxes | 6,606 | : | : |
+| F7/F8 Muxes | 6,606 | - | - |
 | Block RAM (36K) | 16 | 135 | 11.9% |
 | DSPs | **0** | 240 | 0.0% |
 | IOBs | 4 | 210 | 1.9% |
