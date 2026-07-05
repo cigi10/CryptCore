@@ -1,6 +1,8 @@
 # CryptCore : AES-256 Hardware Accelerator SoC on Artix-7
 
-A fully pipelined AES-256 encryption core integrated into a MicroBlaze SoC on the Digilent Arty A7-100T. The core hits **1 block per clock cycle** throughput at **100 MHz**, which works out to **12.8 GB/s** of encryption bandwidth. Timing closure verified at 100 MHz with **WNS = +1.845 ns** and zero failing endpoints.
+A fully pipelined AES-256 encryption core integrated into a MicroBlaze SoC on the Digilent Arty A7-100T. The core hits **1 block per clock cycle** throughput at **100 MHz**, which works out to **12.8 Gbps (1.6 GB/s)** *(100 MHz × 128 bits/cycle = 12.8 Gbps = 1.6 GB/s)* of encryption bandwidth. Timing closure verified at 100 MHz with **WNS = +1.845 ns** and zero failing endpoints.
+
+
 
 ---
 
